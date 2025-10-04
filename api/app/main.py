@@ -2,6 +2,12 @@ import json, os
 from typing import Optional
 
 import asyncio
+import logging
+from asyncpg.exceptions import (
+    InvalidAuthorizationSpecificationError,
+    InvalidCatalogNameError,
+)
+
 from .services.translate import translate_event_dict
 
 from fastapi import FastAPI, Depends, Query, HTTPException
@@ -11,11 +17,14 @@ from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from .db import engine, Base, SessionLocal
+from .db import engine, Base, SessionLocal, DATABASE_URL
+from .db_provision import DBProvisioningError, provision_role_and_database
 from .models import Event, Source
 from .schemas import EventOut, EntityOut, TimelineItem, DraftOut, SourceOut
 from .services.generate import gen_why_now_and_draft
 app = FastAPI(title="Fin News Hot")
+
+logger = logging.getLogger(__name__)
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,8 +36,7 @@ async def get_db():
     async with SessionLocal() as s:
         yield s
 
-@app.on_event("startup")
-async def on_startup():
+async def _bootstrap_database() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Soft migrations for new AI-filter columns
@@ -66,6 +74,23 @@ async def on_startup():
             END IF;
         END $$;
         """))
+
+
+@app.on_event("startup")
+async def on_startup():
+    try:
+        await _bootstrap_database()
+    except (InvalidAuthorizationSpecificationError, InvalidCatalogNameError) as exc:
+        logger.warning(
+            "Database bootstrap failed during startup (%s). Attempting auto-provisioning...",
+            exc,
+        )
+        try:
+            await provision_role_and_database(DATABASE_URL)
+        except DBProvisioningError as prov_exc:
+            logger.error("Auto-provisioning failed: %s", prov_exc)
+            raise
+        await _bootstrap_database()
 
 @app.get("/health")
 async def health(db: AsyncSession = Depends(get_db)):
